@@ -314,8 +314,12 @@ void d3d12_capture(void *swap_ptr, void *)
 	}
 	if (capture_should_init()) {
 		d3d12_init(swap);
+		hlog("d3d12_capture: called d3d12_init(), capture_should_init=true");
 	}
 	if (capture_ready()) {
+		if (data.device11on12 == nullptr) {
+			hlog("ERRROR: data.device11on12 is NULL, will most likely crash");
+		}
 		d3d12_shtex_capture(swap);
 	}
 }

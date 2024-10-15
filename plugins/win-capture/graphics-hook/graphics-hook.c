@@ -569,6 +569,7 @@ bool capture_init_shtex(struct shtex_data **data, HWND window, uint32_t cx, uint
 	}
 
 	active = true;
+	hlog("capture_init_shtex: active=true");
 	return true;
 }
 
@@ -759,6 +760,7 @@ bool capture_init_shmem(struct shmem_data **data, HWND window, uint32_t cx, uint
 	}
 
 	active = true;
+	hlog("capture_init_shmem: active=true");
 	return true;
 }
 
@@ -825,10 +827,28 @@ static bool init_dll(void)
 	return !!dup_hook_mutex;
 }
 
+static const char* GetDLLReason(DWORD reason)
+{
+	switch (reason) {
+	default: break;
+	case DLL_PROCESS_ATTACH : return "DLL_PROCESS_ATTACH";   
+	case DLL_THREAD_ATTACH  : return "DLL_THREAD_ATTACH";   
+	case DLL_THREAD_DETACH  : return "DLL_THREAD_DETACH";   
+	case DLL_PROCESS_DETACH : return "DLL_PROCESS_DETACH";  
+	}
+	return "<UNKNOWN REASON>";
+}
+
 BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID unused1)
 {
+	if ((reason == DLL_THREAD_ATTACH) || (reason == DLL_THREAD_DETACH)) {
+		hlog("DllMain: reason=%s, thread=%d", GetDLLReason(reason), GetCurrentThreadId());
+	} else {
+		hlog("DllMain: reason=%s", GetDLLReason(reason));
+	}
+
 	if (reason == DLL_PROCESS_ATTACH) {
-		wchar_t name[MAX_PATH];
+		wchar_t name[MAX_PATH];   
 
 		dll_inst = hinst;
 
