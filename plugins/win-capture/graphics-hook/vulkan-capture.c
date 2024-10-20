@@ -129,8 +129,6 @@ struct vk_data {
 	ID3D11DeviceContext *d3d11_context;
 };
 
-__declspec(thread) int vk_presenting = 0;
-
 /* ------------------------------------------------------------------------- */
 
 static void *vk_alloc(const VkAllocationCallbacks *ac, size_t size, size_t alignment,
@@ -1195,6 +1193,8 @@ static void vk_capture(struct vk_data *data, VkQueue queue, const VkPresentInfoK
 	}
 }
 
+extern void dxgi_queue_presenting_hwnd(HWND hwnd);
+
 static VkResult VKAPI_CALL OBS_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *info)
 {
 	struct vk_data *const data = get_device_data_by_queue(queue);
@@ -1205,13 +1205,12 @@ static VkResult VKAPI_CALL OBS_QueuePresentKHR(VkQueue queue, const VkPresentInf
 		vk_capture(data, queue, info);
 	}
 
-	if (vk_presenting != 0) {
-		flog("non-zero vk_presenting: %d", vk_presenting);
+	for (uint32_t i = 0; i < info->swapchainCount; ++i) {
+		struct vk_swap_data* const swap = get_swap_data(data, info->pSwapchains[i]);
+		dxgi_queue_presenting_hwnd(swap->hwnd);
 	}
 
-	vk_presenting++;
 	VkResult res = funcs->QueuePresentKHR(queue, info);
-	vk_presenting--;
 	return res;
 }
 
@@ -1619,6 +1618,8 @@ static void VKAPI_CALL OBS_DestroyDevice(VkDevice device, const VkAllocationCall
 	destroy_device(device, ac);
 }
 
+extern void dxgi_register_hwnd(HWND hwnd);
+
 static VkResult VKAPI_CALL OBS_CreateSwapchainKHR(VkDevice device, const VkSwapchainCreateInfoKHR *cinfo,
 						  const VkAllocationCallbacks *ac, VkSwapchainKHR *p_sc)
 {
@@ -1660,6 +1661,8 @@ static VkResult VKAPI_CALL OBS_CreateSwapchainKHR(VkDevice device, const VkSwapc
 			swap_data->d3d11_tex = NULL;
 			swap_data->captured = false;
 			init_swap_data(swap_data, data, sc);
+
+			dxgi_register_hwnd(swap_data->hwnd);
 		}
 	}
 
@@ -1927,6 +1930,8 @@ static void VKAPI_CALL OBS_CmdBeginRenderPass2(VkCommandBuffer commandBuffer,
 	data->funcs.CmdBeginRenderPass2(commandBuffer, pRenderPassBegin, pSubpassBeginInfo);
 }
 
+extern void dxgi_unregister_hwnd(HWND hwnd);
+
 static void VKAPI_CALL OBS_DestroySwapchainKHR(VkDevice device, VkSwapchainKHR sc, const VkAllocationCallbacks *ac)
 {
 	struct vk_data *data = get_device_data(device);
@@ -1941,6 +1946,8 @@ static void VKAPI_CALL OBS_DestroySwapchainKHR(VkDevice device, VkSwapchainKHR s
 			}
 
 			vk_free(ac, swap->swap_images);
+
+			dxgi_unregister_hwnd(swap->hwnd);
 
 			remove_free_swap_data(data, sc, ac);
 		}

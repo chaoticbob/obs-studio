@@ -12,6 +12,11 @@
 #include <d3d12.h>
 #endif
 
+#include <algorithm>
+#include <mutex>
+#include <thread>
+#include <vector>
+
 typedef HRESULT(STDMETHODCALLTYPE *resize_buffers_t)(IDXGISwapChain *, UINT, UINT, UINT, DXGI_FORMAT, UINT);
 typedef HRESULT(STDMETHODCALLTYPE *present_t)(IDXGISwapChain *, UINT, UINT);
 typedef HRESULT(STDMETHODCALLTYPE *present1_t)(IDXGISwapChain1 *, UINT, UINT, const DXGI_PRESENT_PARAMETERS *);
@@ -34,6 +39,17 @@ struct dxgi_swap_data {
 static struct dxgi_swap_data data = {};
 static int swap_chain_mismatch_count = 0;
 constexpr int swap_chain_mismtach_limit = 16;
+
+struct hwnd_swap_data {
+	HWND hwnd;
+	IDXGISwapChain* swap;
+};
+
+std::mutex hwnd_swap_map_mutex;
+static std::vector<hwnd_swap_data> hwnd_swap_map;
+
+std::mutex presenting_hwnds_mutex;
+static std::vector<HWND> presenting_hwnds;
 
 static void STDMETHODCALLTYPE SwapChainDestructed(void *pData)
 {
@@ -183,9 +199,56 @@ static void update_mismatch_count(bool match)
 	}
 }
 
+static bool should_passthrough(IDXGISwapChain *swap)
+{
+	HWND hwnd = nullptr;
+
+	// Find hwnd corresponding to swap
+	{	
+		std::lock_guard<std::mutex> lock(hwnd_swap_map_mutex);
+		
+		if (!hwnd_swap_map.empty()) {
+			auto it = std::find_if(
+				hwnd_swap_map.begin(),
+				hwnd_swap_map.end(),
+				[&swap](const hwnd_swap_data& elem) -> bool {
+					return (elem.swap == swap);
+				});
+
+			if (it != hwnd_swap_map.end()) {
+				hwnd = it->hwnd;
+			} else {
+				DXGI_SWAP_CHAIN_DESC desc = {};
+				swap->GetDesc(&desc);
+				hwnd = desc.OutputWindow;
+
+				hwnd_swap_data data = {};
+				data.hwnd = hwnd;
+				data.swap = swap;
+				hwnd_swap_map.push_back(data);
+
+				hlog("Mapped swap=0x%" PRIX64 " to hwnd=0x%" PRIX64, swap, hwnd);
+			}
+		}
+	}
+	
+
+	if (hwnd != nullptr) {
+		std::lock_guard<std::mutex> lock(presenting_hwnds_mutex);
+
+		auto it = std::find(presenting_hwnds.begin(), presenting_hwnds.end(), hwnd);
+		if (it != presenting_hwnds.end()) {
+			presenting_hwnds.erase(it);
+			return true;
+		}
+	}
+
+	return false;
+}
+
 static HRESULT STDMETHODCALLTYPE hook_present(IDXGISwapChain *swap, UINT sync_interval, UINT flags)
 {
-	if (should_passthrough()) {
+	if (should_passthrough(swap)) {
 		dxgi_presenting = true;
 		const HRESULT hr = RealPresent(swap, sync_interval, flags);
 		dxgi_presenting = false;
@@ -247,7 +310,7 @@ static HRESULT STDMETHODCALLTYPE hook_present(IDXGISwapChain *swap, UINT sync_in
 static HRESULT STDMETHODCALLTYPE hook_present1(IDXGISwapChain1 *swap, UINT sync_interval, UINT flags,
 					       const DXGI_PRESENT_PARAMETERS *params)
 {
-	if (should_passthrough()) {
+	if (should_passthrough(swap)) {
 		dxgi_presenting = true;
 		const HRESULT hr = RealPresent1(swap, sync_interval, flags, params);
 		dxgi_presenting = false;
@@ -315,17 +378,17 @@ bool hook_dxgi(void)
 	if (global_hook_info->offsets.dxgi.present1)
 		present1_addr = get_offset_addr(dxgi_module, global_hook_info->offsets.dxgi.present1);
 
-	DetourTransactionBegin();
+	HRESULT hr = DetourTransactionBegin();
 
 	RealPresent = (present_t)present_addr;
-	DetourAttach(&(PVOID &)RealPresent, hook_present);
+	hr = DetourAttach(&(PVOID &)RealPresent, hook_present);
 
 	RealResizeBuffers = (resize_buffers_t)resize_addr;
-	DetourAttach(&(PVOID &)RealResizeBuffers, hook_resize_buffers);
+	hr = DetourAttach(&(PVOID &)RealResizeBuffers, hook_resize_buffers);
 
 	if (present1_addr) {
 		RealPresent1 = (present1_t)present1_addr;
-		DetourAttach(&(PVOID &)RealPresent1, hook_present1);
+		hr = DetourAttach(&(PVOID &)RealPresent1, hook_present1);
 	}
 
 	const LONG error = DetourTransactionCommit();
@@ -344,4 +407,65 @@ bool hook_dxgi(void)
 	}
 
 	return success;
+}
+
+static void dxgi_register_hwnd_internal(HWND hwnd)
+{
+	std::lock_guard<std::mutex> lock(hwnd_swap_map_mutex);
+	auto it = std::find_if(
+		hwnd_swap_map.begin(),
+		hwnd_swap_map.end(),
+		[hwnd](const hwnd_swap_data& elem) -> bool {
+			return (elem.hwnd == hwnd);
+		});
+	bool found = (it != hwnd_swap_map.end());
+	if (!found) {
+		hwnd_swap_data data = {};
+		data.hwnd = hwnd;
+		hwnd_swap_map.push_back(data);
+	}
+}
+
+static void dxgi_unregister_hwnd_internal(HWND hwnd)
+{
+	std::lock_guard<std::mutex> lock(hwnd_swap_map_mutex);
+	auto it = std::find_if(
+		hwnd_swap_map.begin(),
+		hwnd_swap_map.end(),
+		[hwnd](const hwnd_swap_data& elem) -> bool {
+			return (elem.hwnd == hwnd);
+		});
+	bool found = (it != hwnd_swap_map.end());
+	if (!found) {
+		/*
+		 * This may get the wrong entry if the same
+		 * hwnd is mapped to multiple DXGI swapchains.
+		 */
+		hwnd_swap_map.erase(it);
+	}
+}
+
+static void dxgi_queue_presenting_hwnd_internal(HWND hwnd)
+{
+	std::lock_guard<std::mutex> lock(presenting_hwnds_mutex);
+	presenting_hwnds.push_back(hwnd);
+}
+
+extern "C" {
+
+void dxgi_register_hwnd(HWND hwnd)
+{
+	dxgi_register_hwnd_internal(hwnd);
+}
+
+void dxgi_unregister_hwnd(HWND hwnd)
+{
+	dxgi_queue_presenting_hwnd_internal(hwnd);
+}
+
+void dxgi_queue_presenting_hwnd(HWND hwnd)
+{
+	dxgi_queue_presenting_hwnd_internal(hwnd);
+}
+
 }
