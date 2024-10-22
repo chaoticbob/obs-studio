@@ -54,6 +54,7 @@ extern bool hook_d3d8(void);
 extern bool hook_d3d9(void);
 extern bool hook_d3d12(void);
 extern bool hook_dxgi(void);
+extern bool hook_dxgi_create(void);
 extern bool hook_gl(void);
 #ifdef COMPILE_VULKAN_HOOK
 extern bool hook_vulkan(void);
@@ -243,19 +244,6 @@ static inline bool capture_should_init(void)
 	}
 
 	return should_init;
-}
-
-#if COMPILE_VULKAN_HOOK
-extern __declspec(thread) int vk_presenting;
-#endif
-
-static inline bool should_passthrough()
-{
-#if COMPILE_VULKAN_HOOK
-	return vk_presenting > 0;
-#else
-	return false;
-#endif
 }
 
 #ifdef __cplusplus

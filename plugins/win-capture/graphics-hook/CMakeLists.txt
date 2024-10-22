@@ -43,7 +43,7 @@ target_compile_definitions(graphics-hook PRIVATE COMPILE_D3D12_HOOK)
 
 target_link_libraries(
   graphics-hook
-  PRIVATE OBS::d3d8-api OBS::hook-config OBS::ipc-util OBS::obfuscate Detours::Detours dxguid
+  PRIVATE OBS::d3d8-api OBS::hook-config OBS::ipc-util OBS::obfuscate Detours::Detours dxguid dbghelp psapi
 )
 
 target_link_options(graphics-hook PRIVATE /IGNORE:4099)

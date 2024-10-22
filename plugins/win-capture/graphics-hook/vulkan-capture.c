@@ -129,8 +129,6 @@ struct vk_data {
 	ID3D11DeviceContext *d3d11_context;
 };
 
-__declspec(thread) int vk_presenting = 0;
-
 /* ------------------------------------------------------------------------- */
 
 static void *vk_alloc(const VkAllocationCallbacks *ac, size_t size, size_t alignment,
@@ -1205,13 +1203,7 @@ static VkResult VKAPI_CALL OBS_QueuePresentKHR(VkQueue queue, const VkPresentInf
 		vk_capture(data, queue, info);
 	}
 
-	if (vk_presenting != 0) {
-		flog("non-zero vk_presenting: %d", vk_presenting);
-	}
-
-	vk_presenting++;
 	VkResult res = funcs->QueuePresentKHR(queue, info);
-	vk_presenting--;
 	return res;
 }
 
@@ -1619,9 +1611,15 @@ static void VKAPI_CALL OBS_DestroyDevice(VkDevice device, const VkAllocationCall
 	destroy_device(device, ac);
 }
 
+extern bool hook_dxgi_create(void);
+
 static VkResult VKAPI_CALL OBS_CreateSwapchainKHR(VkDevice device, const VkSwapchainCreateInfoKHR *cinfo,
 						  const VkAllocationCallbacks *ac, VkSwapchainKHR *p_sc)
 {
+	if(!hook_dxgi_create()) {
+		return VK_ERROR_UNKNOWN;
+	}
+
 	struct vk_data *data = get_device_data(device);
 	struct vk_device_funcs *funcs = &data->funcs;
 	if (!data->valid)

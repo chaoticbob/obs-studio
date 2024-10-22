@@ -7,18 +7,28 @@
 #include "graphics-hook.h"
 
 #include <detours.h>
+#include <dbghelp.h>
+#include <psapi.h>
 
 #if COMPILE_D3D12_HOOK
 #include <d3d12.h>
 #endif
 
+#include <mutex>
+#include <vector>
+
 typedef HRESULT(STDMETHODCALLTYPE *resize_buffers_t)(IDXGISwapChain *, UINT, UINT, UINT, DXGI_FORMAT, UINT);
 typedef HRESULT(STDMETHODCALLTYPE *present_t)(IDXGISwapChain *, UINT, UINT);
 typedef HRESULT(STDMETHODCALLTYPE *present1_t)(IDXGISwapChain1 *, UINT, UINT, const DXGI_PRESENT_PARAMETERS *);
+typedef HRESULT(STDMETHODCALLTYPE *create_swap_chain_for_hwnd_t)(IDXGIFactory2 *, IUnknown *, HWND,
+								 const DXGI_SWAP_CHAIN_DESC1 *,
+								 const DXGI_SWAP_CHAIN_FULLSCREEN_DESC *,
+								 IDXGIOutput *, IDXGISwapChain1 **);
 
 resize_buffers_t RealResizeBuffers = nullptr;
 present_t RealPresent = nullptr;
 present1_t RealPresent1 = nullptr;
+create_swap_chain_for_hwnd_t RealCreateSwapChainForHwnd = nullptr;
 
 thread_local int dxgi_presenting = 0;
 struct ID3D12CommandQueue *dxgi_possible_swap_queues[8]{};
@@ -34,6 +44,9 @@ struct dxgi_swap_data {
 static struct dxgi_swap_data data = {};
 static int swap_chain_mismatch_count = 0;
 constexpr int swap_chain_mismtach_limit = 16;
+
+static std::mutex vk_icd_swapchains_mutex;
+static std::vector<IDXGISwapChain*> vk_icd_swapchains;
 
 static void STDMETHODCALLTYPE SwapChainDestructed(void *pData)
 {
@@ -183,9 +196,17 @@ static void update_mismatch_count(bool match)
 	}
 }
 
+static bool should_passthrough(IDXGISwapChain *swap)
+{
+	std::lock_guard<std::mutex> lock(vk_icd_swapchains_mutex);
+
+	auto it = std::find(vk_icd_swapchains.begin(), vk_icd_swapchains.end(), swap);
+	return it != vk_icd_swapchains.end();
+}
+
 static HRESULT STDMETHODCALLTYPE hook_present(IDXGISwapChain *swap, UINT sync_interval, UINT flags)
 {
-	if (should_passthrough()) {
+	if (should_passthrough(swap)) {
 		dxgi_presenting = true;
 		const HRESULT hr = RealPresent(swap, sync_interval, flags);
 		dxgi_presenting = false;
@@ -247,7 +268,7 @@ static HRESULT STDMETHODCALLTYPE hook_present(IDXGISwapChain *swap, UINT sync_in
 static HRESULT STDMETHODCALLTYPE hook_present1(IDXGISwapChain1 *swap, UINT sync_interval, UINT flags,
 					       const DXGI_PRESENT_PARAMETERS *params)
 {
-	if (should_passthrough()) {
+	if (should_passthrough(swap)) {
 		dxgi_presenting = true;
 		const HRESULT hr = RealPresent1(swap, sync_interval, flags, params);
 		dxgi_presenting = false;
@@ -342,6 +363,126 @@ bool hook_dxgi(void)
 		RealPresent1 = nullptr;
 		hlog("Failed to attach Detours hook: %ld", error);
 	}
+
+	return success;
+}
+
+static bool is_dll_in_call_stack(const char *dll_name)
+{
+	HANDLE process = GetCurrentProcess();
+	HANDLE thread = GetCurrentThread();
+	SymInitialize(process, NULL, TRUE);
+
+	CONTEXT ctx = {};
+	RtlCaptureContext(&ctx);
+
+	DWORD arch = IMAGE_FILE_MACHINE_UNKNOWN;
+	STACKFRAME64 sf = {};
+
+	sf.AddrPC.Mode    = AddrModeFlat;
+	sf.AddrFrame.Mode = AddrModeFlat;
+	sf.AddrStack.Mode = AddrModeFlat;
+
+#if defined(_M_IX86)
+	arch = IMAGE_FILE_MACHINE_I386;
+	sf.AddrPC.Offset = ctx.Eip;
+	sf.AddrFrame.Offset = ctx.Ebp;
+	sf.AddrStack.Offset = ctx.Esp;
+#elif defined(_M_X64)
+	arch = IMAGE_FILE_MACHINE_AMD64;
+	sf.AddrPC.Offset = ctx.Rip;
+	sf.AddrFrame.Offset = ctx.Rsp;
+	sf.AddrStack.Offset = ctx.Rsp;
+#else
+#error "unknown machine type"
+#endif
+	bool found = false;
+	while (true) {
+		BOOL res = StackWalk64(arch, process, thread,
+			&sf, &ctx, NULL, SymFunctionTableAccess64,
+			SymGetModuleBase64, NULL);
+		if (!res) {
+			break;
+		}
+
+		DWORD64 module_base = SymGetModuleBase64(process, sf.AddrPC.Offset);
+		if (module_base) {
+			char module_name[MAX_PATH] = {0};
+			if (GetModuleFileNameA((HMODULE)module_base, module_name, MAX_PATH)) {
+				const char *base_name = strrchr(module_name, '\\');
+				base_name = base_name ? (base_name + 1) : module_name;
+				if (_strcmpi(base_name, dll_name) == 0) {
+					found = true;
+					break;
+				}
+			}
+		}
+	}
+
+	SymCleanup(process);
+
+	return found;
+}
+
+static HRESULT hook_create_swap_chain_for_hwnd(IDXGIFactory2 *pThis, IUnknown *pDevice, HWND hWnd,
+					       const DXGI_SWAP_CHAIN_DESC1 *pDesc,
+					       const DXGI_SWAP_CHAIN_FULLSCREEN_DESC *pFullscreenDesc,
+					       IDXGIOutput *pRestrictToOutput, IDXGISwapChain1 **ppSwapChain)
+{
+	HRESULT hr = RealCreateSwapChainForHwnd(pThis, pDevice, hWnd, pDesc, pFullscreenDesc, pRestrictToOutput, ppSwapChain);
+
+	bool has_icd_dll = is_dll_in_call_stack("nvoglv64.dll") || is_dll_in_call_stack("amdvlk64.dll");
+	if (SUCCEEDED(hr) && has_icd_dll) {
+		std::lock_guard<std::mutex> lock(vk_icd_swapchains_mutex);
+		vk_icd_swapchains.push_back(*ppSwapChain);
+		hlog("Marking swap=0x%" PRIX64 " as Vulkan ICD swapchain", *ppSwapChain);
+	}
+
+	return hr;
+}
+
+typedef HRESULT (WINAPI* PFN_CreateDXGIFactory)(REFIID riid, void** ppFactory);
+
+bool hook_dxgi_create(void)
+{
+	HMODULE dxgi_module = get_system_module("dxgi.dll");
+	if (!dxgi_module) {
+		hlog_verbose("Failed to find dxgi.dll. Skipping hook attempt.");
+		return false;
+	}
+
+
+	/* ---------------------- */
+
+	PFN_CreateDXGIFactory create_factory = (PFN_CreateDXGIFactory)GetProcAddress(dxgi_module, "CreateDXGIFactory");
+
+	IDXGIFactory* factory = nullptr;
+	HRESULT hr = create_factory(IID_PPV_ARGS(&factory));
+	if (FAILED(hr)) {
+		return false;
+	}
+
+	IDXGIFactory2* factory2 = nullptr;
+	hr = factory->QueryInterface(IID_PPV_ARGS(&factory2));
+	factory->Release();
+	if (FAILED(hr)) {
+		return false;
+	}
+
+	/* ---------------------- */
+
+	void** vtable = *(void ***)factory2;
+
+	RealCreateSwapChainForHwnd = (create_swap_chain_for_hwnd_t)vtable[15];
+
+	/* ---------------------- */
+
+	DetourTransactionBegin();
+	
+	DetourAttach(&(PVOID &)RealCreateSwapChainForHwnd, hook_create_swap_chain_for_hwnd);
+	
+	const LONG error = DetourTransactionCommit();
+	const bool success = error == NO_ERROR;
 
 	return success;
 }
